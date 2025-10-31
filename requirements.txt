@@ -1,0 +1,10 @@
+# Python packages to install via pip
+# Optimized for Raspberry Pi ARM architecture
+
+# ONNX Runtime for ARM64
+onnxruntime>=1.15.0
+
+# NumPy - Will use system version but ensure minimum
+numpy>=1.24.0
+
+PySide6
