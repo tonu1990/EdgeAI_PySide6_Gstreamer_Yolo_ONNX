@@ -1,0 +1,71 @@
+name: Build Docker Image for Raspberry Pi
+
+# When should this workflow run?
+on:
+  push:
+    branches: [ main ]      # Automatically when you push to main
+  pull_request:
+    branches: [ main ]      # On pull requests to main
+  workflow_dispatch:        # Manual trigger button in GitHub UI
+
+# What jobs should run?
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest  # Use GitHub's Ubuntu machine
+    
+    # Permissions needed to push to GitHub Container Registry
+    permissions:
+      contents: read        # Read repository code
+      packages: write       # Write to GHCR
+    
+    steps:
+      # STEP 1: Get your code from GitHub
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      # STEP 2: Set up QEMU for cross-platform builds
+      # (Allows building ARM images on x86 machine)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      # STEP 3: Set up Docker Buildx (advanced Docker builder)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # STEP 4: Login to GitHub Container Registry
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}           # Your GitHub username
+          password: ${{ secrets.GITHUB_TOKEN }}   # Auto-provided token
+      
+      # STEP 5: Extract metadata (tags and labels for the image)
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix={{branch}}-
+      
+      # STEP 6: Build and push the Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .                    # Build from project root
+          file: ./Dockerfile_Yolo     # Use this Dockerfile
+          platforms: linux/arm64        # Raspberry Pi 5 architecture
+          push: true                    # Push to GHCR after building
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha          # Use GitHub Actions cache
+          cache-to: type=gha,mode=max   # Save cache for next build
+
+      # STEP 7: Output the image name
+      - name: Image built successfully
+        run: |
+          echo "✅ Docker image built and pushed!"
+          echo "📦 Image: ${{ steps.meta.outputs.tags }}"
+          echo "🚀 Pull on Raspberry Pi: docker pull ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest"

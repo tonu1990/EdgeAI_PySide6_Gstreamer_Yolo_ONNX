@@ -1,0 +1,59 @@
+# ============================================
+# Docker Ignore File
+# Files/folders listed here won't be copied to Docker image
+# This makes builds faster and images smaller
+# ============================================
+
+# MODEL FILES (Large - we mount these at runtime instead)
+models/
+*.onnx
+*.pt
+*.pth
+
+# PYTHON CACHE (Generated files we don't need)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# VIRTUAL ENVIRONMENTS (Don't copy local venv)
+venv/
+env/
+ENV/
+
+# IDE FILES (Editor-specific files)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# GIT (Version control files)
+.git/
+.gitignore
+.gitattributes
+
+# DOCUMENTATION (Not needed in container)
+README.md
+docs/
+*.md
+
+# LOGS (Runtime files)
+*.log
+logs/
+
+# OS FILES (System-specific files)
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# TEST FILES (Not needed in production)
+tests/
+test_*.py
+*_test.py
+
+# BUILD ARTIFACTS
+build/
+dist/
+*.egg-info/
