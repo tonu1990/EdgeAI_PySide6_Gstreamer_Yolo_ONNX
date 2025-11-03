@@ -63,14 +63,16 @@ class GStreamerPreviewDetect:
             "ximagesink name=preview_sink sync=false "
 
             # B) DETECTION DISPLAY (OFF at start)
-            "t. ! valve name=detect_valve drop=false ! "
+            "t. ! valve name=detect_valve drop=true ! "
             "queue leaky=downstream max-size-buffers=1 ! "
             "videoconvert ! "
+            "video/x-raw,format=BGRA ! "
             "cairooverlay name=overlay ! "
+            "videoconvert ! "
             "xvimagesink name=detect_sink sync=false "
 
             # C) APPSINK / INFERENCE (OFF at start)
-            "t. ! valve name=apps_valve drop=false ! "
+            "t. ! valve name=apps_valve drop=true ! "
             "queue leaky=downstream max-size-buffers=1 ! "
             "videoconvert ! "
             "videoscale ! "
