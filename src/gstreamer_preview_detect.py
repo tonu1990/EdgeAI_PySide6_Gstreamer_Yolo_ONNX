@@ -60,7 +60,7 @@ class GStreamerPreviewDetect:
             # A) PREVIEW (always on when PLAYING)
             "t. ! queue leaky=downstream max-size-buffers=1 ! "
             "videoconvert ! "
-            "xvimagesink name=preview_sink sync=false "
+            "ximagesink name=preview_sink sync=false "
 
             # B) DETECTION DISPLAY (OFF at start)
             "t. ! valve name=detect_valve drop=false ! "
