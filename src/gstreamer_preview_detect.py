@@ -60,7 +60,7 @@ class GStreamerPreviewDetect:
             # A) PREVIEW (always on when PLAYING)
             "t. ! queue leaky=downstream max-size-buffers=1 ! "
             "videoconvert ! "
-            "ximagesink name=preview_sink sync=false "
+            "xvimagesink name=preview_sink sync=false "
 
             # B) DETECTION DISPLAY (OFF at start)
             "t. ! valve name=detect_valve drop=true ! "
@@ -133,31 +133,27 @@ class GStreamerPreviewDetect:
         print("[MAIN]  Preview started")
 
     def stop(self):
-        """
-        Stop gracefully: quit GLib loop, set pipeline to NULL, join thread.
-        """
         if not self.pipeline:
             return
 
         print("[MAIN] Stopping preview...")
         try:
             if self.main_loop and self._running:
-                # ask GLib loop to quit
                 self.main_loop.quit()
         except Exception as e:
             print(f"[MAIN] Warning while quitting GLib loop: {e}")
 
-        # Wait a moment for the loop to exit
-        if self._glib_thread:
+        # If we are NOT on the GLib thread, it's safe to join
+        if self._glib_thread and threading.current_thread() is not self._glib_thread:
             self._glib_thread.join(timeout=2.0)
 
-        # Stop the pipeline
+        # Always set pipeline to NULL (idempotent)
         self.pipeline.set_state(Gst.State.NULL)
         print("[MAIN]  Pipeline stopped")
 
-        # Reset flags
         self._running = False
-        self._glib_thread = None
+        if threading.current_thread() is not self._glib_thread:
+            self._glib_thread = None
         self.main_loop = None
 
     # ----------------- INTERNAL -----------------
