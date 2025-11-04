@@ -111,7 +111,7 @@ class GStreamerController:
             "videoconvert ! "
             
             # Split into multiple branches using 'tee'
-            "tee name=t ! "
+            "tee name=t "
             
             # ========== BRANCH 1: PREVIEW WINDOW (Always Active) ==========
             # This branch always shows clean camera feed
