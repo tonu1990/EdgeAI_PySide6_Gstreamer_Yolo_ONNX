@@ -130,7 +130,19 @@ class GStreamerPreviewDetect:
             self._running = False
             raise RuntimeError("[MAIN] ERROR: Could not start pipeline")
 
-        print("[MAIN]  Preview started")
+        # CRITICAL FIX: Wait for the state change to complete
+        # This ensures the pipeline actually reaches PLAYING before returning
+        state_change_ret, state, pending = self.pipeline.get_state(timeout=5 * Gst.SECOND)
+        
+        if state_change_ret == Gst.StateChangeReturn.FAILURE:
+            self._running = False
+            self.pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("[MAIN] ERROR: Pipeline failed to reach PLAYING state")
+        
+        if state != Gst.State.PLAYING:
+            print(f"[MAIN] WARNING: Pipeline in {state.value_nick} state instead of PLAYING")
+        
+        print("[MAIN] ✓ Preview started (PLAYING)")
 
     def stop(self):
         if not self.pipeline:
