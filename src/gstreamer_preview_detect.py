@@ -1,9 +1,26 @@
+#!/usr/bin/env python3
+"""
+Static GStreamer pipeline with:
+- tee → Preview (always visible)
+- tee → Detection path (BGRA → cairooverlay → videoconvert → outputselector → [fakesink | xvimagesink])
+- tee → Appsink (RGB 416x416) behind a valve
+
+We keep one pipeline the whole run. We *show/hide* the detection window by
+switching outputselector's active-pad (fakesink ↔ xvimagesink). We *open/close*
+the apps branch via a valve. No live unlink/relink.
+
+Notes:
+- We build a FRESH pipeline on each Start to avoid Xv "stale window" quirks.
+- Sinks use sync=false *and* async=false to avoid preroll stalls.
+- We pin BGRA before cairooverlay to avoid "not-negotiated".
+- All element property changes are marshalled to the GLib thread via idle_add.
+"""
+
 import gi
-gi.require_version('Gst', '1.0')
+gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 
 import threading
-import time
 
 
 class GStreamerPreviewDetect:
@@ -14,10 +31,9 @@ class GStreamerPreviewDetect:
                  mjpeg_fps_num: int = 30,
                  detect_width: int = 416,
                  detect_height: int = 416):
-        # Init GStreamer once
         Gst.init(None)
 
-        # config
+        # Config
         self.camera_device = camera_device
         self.mjpeg_width = mjpeg_width
         self.mjpeg_height = mjpeg_height
@@ -25,184 +41,272 @@ class GStreamerPreviewDetect:
         self.detect_width = detect_width
         self.detect_height = detect_height
 
-        # runtime
+        # Runtime (reset on every Start/Stop)
         self.pipeline = None
-        self.main_loop = None
         self.bus = None
-
-        # named elements we’ll cache (used later when we add detection)
-        self.preview_sink = None
-        self.detect_sink = None
-        self.overlay = None
-        self.detect_valve = None
-        self.apps_valve = None
-        self.appsink = None
-
-        # threads
+        self.main_loop = None
         self._glib_thread = None
         self._running = False
 
-    # ----------------- PIPELINE -----------------
+        # Named elements
+        self.preview_sink = None
+        self.detect_sink = None
+        self.detect_hidden = None  # fakesink
+        self.overlay = None
+        self.appsink = None
+        self.apps_valve = None
+        self.det_selector = None   # outputselector
+        self.tee = None
 
-    def build_pipeline(self):
-        """
-        Build the 3-branch pipeline.
-        Valves are OFF initially so only the preview branch runs work.
-        """
-        pipeline_str = (
-            # Camera → MJPEG caps → decoder → RGB → tee
+        # Track UI state
+        self._detection_enabled = False
+
+    # ---------------------------------------------------------------------
+    # Build the pipeline (fresh each Start)
+    # ---------------------------------------------------------------------
+    def _pipeline_str(self) -> str:
+        return (
+            # Camera → MJPEG caps → decode → convert → tee
             f"v4l2src device={self.camera_device} ! "
             f"image/jpeg,width={self.mjpeg_width},height={self.mjpeg_height},framerate={self.mjpeg_fps_num}/1 ! "
-            "jpegdec ! "
-            "videoconvert ! "
-            "tee name=t "
+            "jpegdec ! videoconvert ! tee name=t "
 
-            # A) PREVIEW (always on when PLAYING)
+            # A) PREVIEW (always visible)
             "t. ! queue leaky=downstream max-size-buffers=1 ! "
-            "videoconvert ! "
-            "xvimagesink name=preview_sink sync=false "
+            "videoconvert ! videoscale ! "
+            "xvimagesink name=preview_sink sync=false async=false force-aspect-ratio=true "
 
-            # B) DETECTION DISPLAY (OFF at start)
-            "t. ! valve name=detect_valve drop=false ! "
-            "queue leaky=downstream max-size-buffers=1 ! "
-            "videoconvert ! "
-            "video/x-raw,format=BGRA ! "
+            # B) DETECTION DISPLAY PATH (BGRA → cairooverlay → outputselector)
+            "t. ! queue leaky=downstream max-size-buffers=1 ! "
+            "videoconvert ! video/x-raw,format=BGRA ! "
             "cairooverlay name=overlay ! "
             "videoconvert ! "
-            "xvimagesink name=detect_sink sync=false "
+            "outputselector name=det_sel pad-negotiation-mode=none "
+            # det_sel → hidden (default)
+            "det_sel. ! queue ! fakesink name=detect_hidden sync=false "
+            # det_sel → visible (we'll switch to this on demand)
+            "det_sel. ! queue ! xvimagesink name=detect_sink sync=false async=false force-aspect-ratio=true "
 
-            # C) APPSINK / INFERENCE (OFF at start)
-            "t. ! valve name=apps_valve drop=false ! "
-            "queue leaky=downstream max-size-buffers=1 ! "
-            "videoconvert ! "
-            "videoscale ! "
+            # C) APPS / INFERENCE (valved OFF at start)
+            "t. ! queue leaky=downstream max-size-buffers=1 ! "
+            "videoconvert ! videoscale ! "
             f"video/x-raw,format=RGB,width={self.detect_width},height={self.detect_height} ! "
-            "appsink name=det_sink emit-signals=True max-buffers=1 drop=True"
+            "valve name=apps_valve drop=true ! "
+            "appsink name=det_sink emit-signals=true max-buffers=1 drop=true"
         )
 
-        try:
-            self.pipeline = Gst.parse_launch(pipeline_str)
-            print("[PIPELINE]  Created")
-        except Exception as e:
-            raise RuntimeError(f"[PIPELINE] ERROR creating pipeline: {e}")
+    def build_pipeline(self) -> None:
+        if self.pipeline is not None:
+            raise RuntimeError("Pipeline already exists. Call stop() before build_pipeline().")
 
-        # cache elements we may use later
-        self.preview_sink = self.pipeline.get_by_name("preview_sink")
-        self.detect_sink = self.pipeline.get_by_name("detect_sink")
-        self.overlay = self.pipeline.get_by_name("overlay")
-        self.detect_valve = self.pipeline.get_by_name("detect_valve")
-        self.apps_valve = self.pipeline.get_by_name("apps_valve")
-        self.appsink = self.pipeline.get_by_name("det_sink")
+        self.pipeline = Gst.parse_launch(self._pipeline_str())
+        print("[PIPELINE] Created")
 
-        # Bus watch
+        # Cache elements
+        self.preview_sink  = self.pipeline.get_by_name("preview_sink")
+        self.detect_sink   = self.pipeline.get_by_name("detect_sink")
+        self.detect_hidden = self.pipeline.get_by_name("detect_hidden")
+        self.overlay       = self.pipeline.get_by_name("overlay")
+        self.appsink       = self.pipeline.get_by_name("det_sink")
+        self.apps_valve    = self.pipeline.get_by_name("apps_valve")
+        self.det_selector  = self.pipeline.get_by_name("det_sel")
+        self.tee           = self.pipeline.get_by_name("t")
+
+        if not all([self.preview_sink, self.detect_hidden, self.detect_sink,
+                    self.appsink, self.apps_valve, self.det_selector, self.tee]):
+            raise RuntimeError("[PIPELINE] Missing expected elements")
+
+        # Bus + GLib loop
+        self.main_loop = GLib.MainLoop()
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
-        self.bus.connect('message', self._on_bus_message)
+        self.bus.connect("message", self._on_bus_message)
 
-        # If overlay exists, we can connect a dummy draw now (we’ll wire real drawing when detection is enabled)
+        # Overlay draw (noop for now)
         if self.overlay:
-            self.overlay.connect('draw', self._on_draw_noop)
+            self.overlay.connect("draw", self._on_draw_noop)
 
-    # ----------------- START / STOP -----------------
+        # Default: detection UI hidden (selector to fakesink), apps OFF
+        self._set_selector_target(hidden=True)
+        self._detection_enabled = False
+        if self.apps_valve:
+            self.apps_valve.set_property("drop", True)
 
-    def start(self):
-        """
-        Start GLib loop in a small background thread and set the pipeline PLAYING.
-        """
-        if not self.pipeline:
-            raise RuntimeError("Call build_pipeline() before start().")
+    # ---------------------------------------------------------------------
+    # Start / Stop
+    # ---------------------------------------------------------------------
+    def start(self) -> None:
+        """Fresh build, start GLib, set PLAYING, wait for settle."""
+        self.build_pipeline()
 
-        if self._running:
-            print("[MAIN] Already running.")
-            return
-
-        # Create the GLib loop
-        self.main_loop = GLib.MainLoop()
         self._running = True
-
-        # Start GLib in a background thread (Qt stays responsive)
         self._glib_thread = threading.Thread(target=self._run_glib, daemon=True)
         self._glib_thread.start()
 
-        # Set pipeline to PLAYING
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             self._running = False
-            raise RuntimeError("[MAIN] ERROR: Could not start pipeline")
-
-        # CRITICAL FIX: Wait for the state change to complete
-        # This ensures the pipeline actually reaches PLAYING before returning
-        state_change_ret, state, pending = self.pipeline.get_state(timeout=5 * Gst.SECOND)
-        
-        if state_change_ret == Gst.StateChangeReturn.FAILURE:
-            self._running = False
             self.pipeline.set_state(Gst.State.NULL)
-            raise RuntimeError("[MAIN] ERROR: Pipeline failed to reach PLAYING state")
-        
-        if state != Gst.State.PLAYING:
-            print(f"[MAIN] WARNING: Pipeline in {state.value_nick} state instead of PLAYING")
-        
-        print("[MAIN] ✓ Preview started (PLAYING)")
+            raise RuntimeError("[MAIN] set_state(PLAYING) failed")
 
-    def stop(self):
+        # Wait for settle; PLAYING preferred, PAUSED may still render
+        _chg, state, _pend = self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        if state == Gst.State.PLAYING:
+            print("[MAIN] Preview started (PLAYING)")
+        else:
+            print(f"[MAIN] WARNING: Pipeline settled in {state.value_nick}")
+
+    def stop(self) -> None:
+        """Clean shutdown and clear references so next Start is fresh."""
         if not self.pipeline:
             return
 
         print("[MAIN] Stopping preview...")
         try:
-            if self.main_loop and self._running:
+            self.pipeline.set_state(Gst.State.NULL)
+        except Exception as e:
+            print(f"[MAIN] Warning: set_state(NULL): {e}")
+
+        try:
+            if self.main_loop and self._running and self.main_loop.is_running():
                 self.main_loop.quit()
         except Exception as e:
-            print(f"[MAIN] Warning while quitting GLib loop: {e}")
+            print(f"[MAIN] Warning: main_loop.quit(): {e}")
 
-        # If we are NOT on the GLib thread, it's safe to join
+        # Join GLib thread (but not from inside it)
         if self._glib_thread and threading.current_thread() is not self._glib_thread:
             self._glib_thread.join(timeout=2.0)
 
-        # Always set pipeline to NULL (idempotent)
-        self.pipeline.set_state(Gst.State.NULL)
-        print("[MAIN]  Pipeline stopped")
+        try:
+            if self.bus:
+                self.bus.remove_signal_watch()
+        except Exception:
+            pass
 
+        # Clear runtime
         self._running = False
-        if threading.current_thread() is not self._glib_thread:
-            self._glib_thread = None
+        self._glib_thread = None
         self.main_loop = None
+        self.bus = None
 
-    # ----------------- INTERNAL -----------------
+        # Clear element refs and pipeline
+        self.preview_sink = None
+        self.detect_sink = None
+        self.detect_hidden = None
+        self.overlay = None
+        self.appsink = None
+        self.apps_valve = None
+        self.det_selector = None
+        self.tee = None
+        self.pipeline = None
 
+        print("[MAIN] Pipeline stopped")
+
+    # ---------------------------------------------------------------------
+    # Detection show/hide + apps valve
+    # ---------------------------------------------------------------------
+    def set_detection_enabled(self, enabled: bool) -> None:
+        """Show/hide detection window (selector) and open/close apps branch (valve)."""
+        if not self.pipeline:
+            return
+
+        enabled = bool(enabled)
+        if self._detection_enabled == enabled:
+            return
+
+        def _apply():
+            # Switch selector target (fakesink ↔ xvimagesink)
+            self._set_selector_target(hidden=not enabled)
+
+            # Toggle apps branch
+            if self.apps_valve:
+                self.apps_valve.set_property("drop", not enabled)
+
+            self._detection_enabled = enabled
+            return False  # remove idle source
+
+        GLib.idle_add(_apply)
+
+    # Helper: set outputselector's active-pad to hidden or visible branch
+    def _set_selector_target(self, hidden: bool) -> None:
+        """
+        Find which src pad of det_selector feeds the fakesink vs. detect xvimagesink,
+        then set that pad as 'active-pad'.
+        """
+        if not self.det_selector:
+            return
+
+        # Starting from the sinks, walk upstream peers until we hit the selector.
+        target_elem = self.detect_hidden if hidden else self.detect_sink
+        pad = self._find_selector_src_pad_for_downstream(self.det_selector, target_elem)
+
+        if pad is not None:
+            try:
+                self.det_selector.set_property("active-pad", pad)
+            except Exception as e:
+                print(f"[SELECTOR] Failed to set active-pad: {e}")
+
+    def _find_selector_src_pad_for_downstream(self, selector_elem, downstream_elem):
+        """
+        Walk upstream from the given 'downstream_elem' (fakesink or xvimagesink),
+        following pad peers through simple elements (queue/videoconvert/etc.)
+        until we reach 'selector_elem'. Return the selector's src pad that feeds
+        that downstream elem, or None if not found.
+        """
+        # Start: sink pad of the downstream element
+        pad = downstream_elem.get_static_pad("sink")
+        seen = set()
+
+        while pad:
+            peer = pad.get_peer()
+            if not peer:
+                return None
+            up_elem = peer.get_parent_element()
+            if not up_elem or up_elem in seen:
+                return None
+            seen.add(up_elem)
+
+            if up_elem == selector_elem:
+                # 'peer' is one of the selector's src pads
+                return peer
+
+            # Move further upstream: from the upstream element, take its sink pad
+            pad = up_elem.get_static_pad("sink")
+
+        return None
+
+    # ---------------------------------------------------------------------
+    # GLib + Bus + Overlay (noop)
+    # ---------------------------------------------------------------------
     def _run_glib(self):
-        """Runs the GLib main loop; separate thread."""
         try:
             self.main_loop.run()
         except Exception as e:
             print(f"[GLIB] Loop error: {e}")
 
     def _on_bus_message(self, bus, message):
-        """Basic bus handler for errors, warnings, state changes, EOS."""
         t = message.type
 
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"[GSTREAMER ERROR] {err}\nDEBUG: {debug}")
-            # Stop everything on error
-            self.stop()
+            print(f"[GST ERROR] {err}\nDEBUG: {debug}")
+            GLib.idle_add(self.stop)
 
         elif t == Gst.MessageType.WARNING:
             warn, debug = message.parse_warning()
-            print(f"[GSTREAMER WARNING] {warn}")
+            print(f"[GST WARN]  {warn}\nDEBUG: {debug}")
 
         elif t == Gst.MessageType.STATE_CHANGED:
-            # Optional: log pipeline state transitions
             if message.src == self.pipeline:
-                old, new, pending = message.parse_state_changed()
+                old, new, _ = message.parse_state_changed()
                 print(f"[STATE] {old.value_nick} → {new.value_nick}")
 
         elif t == Gst.MessageType.EOS:
             print("[BUS] End of stream")
-            self.stop()
+            GLib.idle_add(self.stop)
 
         return True
 
     def _on_draw_noop(self, overlay, context, timestamp, duration):
-        """Placeholder draw for detection window (does nothing in Phase 1)."""
+        # We’ll draw boxes here once the detector is wired
         return
